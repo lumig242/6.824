@@ -31,6 +31,7 @@ type Master struct {
 // up to report that they are ready to receive tasks.
 func (mr *Master) Register(args *RegisterArgs, _ *struct{}) error {
 	mr.Lock()
+	// defer the statement until the surrounding function returns
 	defer mr.Unlock()
 	debug("Register: worker %s\n", args.Worker)
 	mr.workers = append(mr.workers, args.Worker)
