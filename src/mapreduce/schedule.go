@@ -24,5 +24,31 @@ func (mr *Master) schedule(phase jobPhase) {
 	//
 	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
 	//
+
+	barrier := make(chan struct{})
+	for taskId := 0; taskId < ntasks; taskId++ {
+		// Get a worker
+		go func(taskId int) {
+			worker := <-mr.registerChannel
+			if call(worker, "Worker.DoTask", &DoTaskArgs{
+				mr.jobName,
+				mr.files[taskId],
+				phase,
+				taskId,
+				nios,
+			}, new(struct{})) {
+				// Run task successfully
+				barrier <- struct{}{}
+				// Return the worker!!!
+				mr.registerChannel <- worker
+				fmt.Printf("Finish task %d.\n", taskId)
+			}
+		}(taskId)
+	}
+
+	for taskId := 0; taskId < ntasks; taskId++ {
+		<- barrier
+	}
+
 	fmt.Printf("Schedule: %v phase done\n", phase)
 }
