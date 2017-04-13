@@ -41,15 +41,18 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd
-	persister *Persister
-	me        int // index into peers[]
+	mu          sync.Mutex
+	peers       []*labrpc.ClientEnd
+	persister   *Persister
+	me          int // index into peers[]
 
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	currentTerm int
+	votedFor    int
+	log         []int
 }
 
 // return currentTerm and whether this server
