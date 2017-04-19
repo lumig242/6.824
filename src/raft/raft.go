@@ -18,48 +18,58 @@ package raft
 //
 
 import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"time"
+	"strconv"
+)
 
 // import "bytes"
 // import "encoding/gob"
 
+const (
+	LEADER = iota
+	FOLLOWER
+	CANDIDATE
+)
 
-
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make().
-//
-type ApplyMsg struct {
-	Index       int
-	Command     interface{}
-	UseSnapshot bool   // ignore for lab2; only used in lab3
-	Snapshot    []byte // ignore for lab2; only used in lab3
-}
 
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd
-	persister *Persister
-	me        int // index into peers[]
+	mu           sync.Mutex
+	peers        []*labrpc.ClientEnd
+	persister    *Persister
+	me           int // index into peers[]
 
-	// Your data here.
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
 
+	state        int
+
+	currentTerm  int
+	votedFor     int
+	logEntry     []*LogEntry
+
+									 // Volatile state on all servers
+	commitIndex  int
+	lastApplied  int
+
+									 // Volatile state on leaders
+	nextIndex    []int
+	matchIndex   []int
+
+									 // Number of votes received currently
+	voteReceived int
+
+	// Channels
+	chanWinElection chan bool
+	chanHeartbeat chan bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here.
-	return term, isleader
+	return rf.currentTerm, rf.state == LEADER
 }
 
 //
@@ -92,50 +102,60 @@ func (rf *Raft) readPersist(data []byte) {
 
 
 
+//
+// RequestVote RPC handler. Be initiate by rf.sendRequestVote()
+// When a vote request received:
+//   1. Approve the first request with valid term
+//	 2. Reject all the following requests
+//
+func (rf *Raft) RequestVoteRPC(args RequestVoteArgs, reply *RequestVoteReply) {
+	println("SERVER " + strconv.Itoa(rf.me) + " @term" + strconv.Itoa(rf.currentTerm) + ": Vote request from server" + strconv.Itoa(args.CandidateId) + " @term" + strconv.Itoa(args.Term))
+	if rf.currentTerm > args.Term || (rf.currentTerm == args.Term && rf.votedFor != -1){
+		// Outdated candidates. Simply reject. or
+		// Already voted in this round of election
+		reply.Term = rf.currentTerm
+		reply.Vote = false
+	} else {
+		// First valid request received. Approve this request
 
-//
-// example RequestVote RPC arguments structure.
-//
-type RequestVoteArgs struct {
-	// Your data here.
+		if rf.state == LEADER {
+			println("Server " + strconv.Itoa(rf.me) + "@term" + strconv.Itoa(rf.currentTerm) + " is no longer a leader 2")
+		}
+		rf.mu.Lock()
+		rf.state = FOLLOWER
+		rf.voteReceived = 0
+		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term
+		rf.mu.Unlock()
+		reply.Vote = true
+	}
 }
 
 //
-// example RequestVote RPC reply structure.
+// AppendEntries RPC Handler. Called by rf.sendAppendEntries()
+// When an appendEntries received:
+//   1. Reject outdated message
+//   2. Move to follower state if is a candidate
+//   3. Confirm receive of heartbeat message and update term
 //
-type RequestVoteReply struct {
-	// Your data here.
-}
+func (rf *Raft) AppendEntriesRPC(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < rf.currentTerm {
+		// Outdated heartbeat message
+		reply.Term = rf.currentTerm
+		reply.Outdated = true
+		return
+	}
+	reply.Outdated = false
+	rf.currentTerm = args.Term
 
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here.
-}
+	if rf.state == CANDIDATE {
+		rf.state = FOLLOWER
+		rf.init()
+	}
 
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// returns true if labrpc says the RPC was delivered.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	rf.chanHeartbeat <- true
+	rf.currentTerm = args.Term
 }
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -155,7 +175,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-
 	return index, term, isLeader
 }
 
@@ -170,6 +189,38 @@ func (rf *Raft) Kill() {
 }
 
 //
+// The background go routine
+//
+func (rf *Raft) run() {
+	for {
+		// the state read can be in a race condition
+		// we have to check again and do the right thing in each rule.
+		switch rf.state {
+		case FOLLOWER:
+			select {
+				case <-rf.chanHeartbeat:  // Receive heartbeat message
+					DPrintf("Received hearbeat message", rf.me)
+				case <-time.After(TIMEOUT_DURATION):
+						rf.mu.Lock()
+						if rf.state != LEADER {
+							rf.state = CANDIDATE
+						}
+						rf.mu.Unlock()
+				}
+		case CANDIDATE:
+			rf.doCandidateStuff()
+		case LEADER:
+			rf.doLeaderStuff()
+		}
+	}
+}
+
+func (rf *Raft) init() {
+	rf.votedFor = -1;
+	rf.voteReceived = 0;
+}
+
+//
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -180,18 +231,46 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
+
+
+	func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
 
-	// Your initialization code here.
+		rf := &Raft{
+			peers:     peers,
+			persister: persister,
+			me:        me,
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+			state: FOLLOWER,
+
+			// persistent state on all servers
+			currentTerm: 0,
+			votedFor:    -1, // initialize as -1 for not voted yet
+			logEntry:         []*LogEntry{{Term: 0}},
+
+			// volatile state on all servers
+			commitIndex: 0,
+			lastApplied: 0,
+
+			// volatile state on leaders
+			nextIndex:  make([]int, len(peers)),
+			matchIndex: make([]int, len(peers)),
+
+			// volatile state on candidates
+			voteReceived: 0,
+
+			// Channels
+			chanWinElection: make(chan bool),
+			chanHeartbeat: make(chan bool),
+		}
+
+		// TODO: Find out what persistent means..
+
+		go rf.run() // Start background go routine
+
+		// initialize from state persisted before a crash
+		rf.readPersist(persister.ReadRaftState())
 
 
-	return rf
-}
+		return rf
+	}
